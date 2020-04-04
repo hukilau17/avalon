@@ -103,7 +103,6 @@ Player = recordclass.recordclass('Player', 'user role side vote outcome')
 # Game parameters
 
 N_EVIL = {
-    4 : 1, # DEBUG temporary!
     5 : 2,
     6 : 2,
     7 : 3,
@@ -113,7 +112,6 @@ N_EVIL = {
     }
 
 QUEST_LISTS = {
-    4 : [(2, 1), (3, 1), (2, 1), (3, 1), (3, 1)], # DEBUG temporary!
     5 : [(2, 1), (3, 1), (2, 1), (3, 1), (3, 1)],
     6 : [(2, 1), (3, 1), (4, 1), (3, 1), (4, 1)],
     7 : [(2, 1), (3, 1), (3, 1), (4, 2), (4, 1)],
@@ -345,22 +343,24 @@ class Avalon(discord.Client):
     async def av_info(self, message):
         # av info: Prints out game info
         if (await self.check_game(message)):
-            await message.channel.send('**Current players:**\n%s' % ', '.join([player.user.name for player in self.players]))
-            await message.channel.send('**Game settings:**\n%s' % '\n'.join(['%s %s' % \
-                                                                         (FEATURE_NAMES[key], 'enabled' if value else 'disabled') \
-                                                                         for key, value in self.features.items()]))
+            info = '**Current players:**\n%s\n' % ', '.join([player.user.name for player in self.players])
+            info += '**Game settings:**\n%s\n' % '\n'.join(['%s %s' % \
+                                                            (FEATURE_NAMES[key], 'enabled' if value else 'disabled') \
+                                                            for key, value in self.features.items()])
             if self.merged:
-                await message.channel.send('**Merged roles:**:\n%s' % '\n'.join([', '.join([ROLE_NAMES[role.value] for role in group]) for group in self.merged]))
+                info += '**Merged roles:**:\n%s\n' % '\n'.join([', '.join([ROLE_NAMES[role.value] for role in group]) for group in self.merged])
             if not self.running:
-                await message.channel.send('Game has not yet started.')
+                info += 'Game has not yet started.'
+                await message.channel.send(info)
                 return
-            await message.channel.send('**Current team**:\n%s' % ', '.join([player.user.name for player in self.team]))
-            await message.channel.send('**Current results**:\n```\n%s\n%s\nVote tracker: %d\n```' % \
-                                       (' '.join([str(i[0]) for i in QUEST_LISTS[len(self.players)]]),
-                                        ' '.join(['S' if i else 'F' for i in self.quest_results]),
-                                        self.reject_counter))
+            info += '**Current team**:\n%s\n' % ', '.join([player.user.name for player in self.team])
+            info += '**Current results**:\n```\n%s\n%s\nVote tracker: %d\n```\n' % \
+                    (' '.join([str(i[0]) for i in QUEST_LISTS[len(self.players)]]),
+                     ' '.join(['S' if i else 'F' for i in self.quest_results]),
+                     self.reject_counter)
             if self.lady:
-                await message.channel.send('%s currently has the Lady of the Lake' % self.lady.user.name)
+                info += '%s currently has the Lady of the Lake' % self.lady.user.name
+            await message.channel.send(info)
             await self.av_poke(message)
 
 
@@ -850,7 +850,6 @@ av unmerge: Unmerge all previously merged special roles''')
 
 
 
-
     ##### Other game running methods #####
 
 
@@ -983,7 +982,9 @@ Please cast your votes **privately** by DMing either "av approve" or "av reject"
         # Tabulate the votes that were cast
         if self.waiting_for_votes:
             self.waiting_for_votes = False
-            await self.main_channel.send('Voting for the team has concluded. Results are:\n%s' % '\n'.join(['%s: %s' % (p.user.name, 'Approve' if p.vote == APPROVE else 'Reject') for p in self.players]))
+            voting_msg = (await self.main_channel.send('Voting for the team has concluded. Results are:\n%s' % \
+                                                       '\n'.join(['%s: %s' % (p.user.name, 'Approve' if p.vote == APPROVE else 'Reject') for p in self.players])))
+            voting_msg.delete(delay=10) # Delete after 10 seconds
             if sum([p.vote for p in self.players]) > len(self.players) // 2:
                 await self.main_channel.send('The team consisting of %s was approved!' % ', '.join([player.user.mention for player in self.team]))
                 self.reject_counter = 1
@@ -1033,7 +1034,7 @@ Please cast your votes **privately** by DMing either "av approve" or "av reject"
             await self.main_channel.send('**The game is over. Evil wins!!**')
             await self.finish_game(EVIL)
         elif self.reject_counter >= 5:
-            await self.main_channel.send('**The game is over. Evil wins!!**')
+            await self.main_channel.send('**The game is over. The vote tracker has reached 5. Evil wins!!**')
             await self.finish_game(EVIL)
         elif self.quest_results.count(True) >= 3:
             if self.features['merlin']:
@@ -1049,11 +1050,11 @@ Please cast your votes **privately** by DMing either "av approve" or "av reject"
         # Announce the roles and clear the `running' flag
         self.owner = None
         self.running = False
-        await self.main_channel.send('Game role reveals:')
+        info = '**Game role reveals:**\n'
         with open('avalon_stats', 'rb') as o:
             stats = pickle.load(o)
         for p in self.players:
-            await self.main_channel.send('%s: %s' % (p.user.mention, '/'.join([ROLE_NAMES[role.value] for role in p.role])))
+            info += '%s: %s\n' % (p.user.mention, '/'.join([ROLE_NAMES[role.value] for role in p.role]))
             pdata = stats.setdefault(p.user.id, {})
             for role in p.role:
                 rdata = pdata.setdefault(role.value, [0, 0])
@@ -1061,6 +1062,7 @@ Please cast your votes **privately** by DMing either "av approve" or "av reject"
                     rdata[0] += 1
                 else:
                     rdata[1] += 1
+        await self.main_channel.send(info)
         with open('avalon_stats', 'wb') as o:
             pickle.dump(stats, o)
         
