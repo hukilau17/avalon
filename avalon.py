@@ -6,6 +6,7 @@ import recordclass
 import enum
 import sys
 import io
+import pickle
 import traceback
 import random
 import asyncio
@@ -15,7 +16,7 @@ import asyncio
 GOOD = True
 EVIL = False
 
-ACCEPT = True
+APPROVE = True
 REJECT = False
 
 SUCCESS = True
@@ -60,6 +61,22 @@ ROLE_NAMES = [
     ]
 
 
+ROLE_COMMANDS = [
+    # Command names for all the roles
+    'none',
+    'servant',
+    'minion',
+    'merlin',
+    'assassin',
+    'morgana',
+    'percival',
+    'mordred',
+    'oberon',
+    'norebo',
+    'palm',
+    ]
+
+
 
 FEATURE_NAMES = {
     # Descriptive names for all the features
@@ -78,7 +95,7 @@ Player = recordclass.recordclass('Player', 'user role side vote outcome')
 # user: the discord.User controlling this player.
 # role: the Role of this player.
 # side: True if this player is good, False if they are evil.
-# vote: True for an accept vote, False for a reject.
+# vote: True for an approve vote, False for a reject.
 # outcome: True for a success outcome, False for a fail.
 
 
@@ -223,13 +240,16 @@ class Avalon(discord.Client):
         self.team = [] # List of members of the current team
         self.leader = None
         self.quest_results = [] # Boolean values signifying which quests so far have passed
-        self.reject_counter = 0 # Number of consecutive teams that have been rejected
+        self.reject_counter = 1 # Number of consecutive teams that have been rejected
         self.lady = None # The player who currently has the Lady of the Lake
         self.investigated = [] # Keep track of who has been investigated using Lady of the Lake
         self.waiting_for_votes = False # True if the client is waiting for people to cast their votes
         self.waiting_for_outcomes = False # True if the client is waiting for people to decide the outcome
         self.waiting_for_lady = False # True if the client is waiting for someone to play the Lady of the Lake
         self.waiting_for_assassin = False # True if the client is waiting for the assassin to kill someone
+        self.has_team = False # if True, init_team() is a no-op until it is switched to False again
+        self.tabulating_votes = False # True if the bot is currently tabulating voting results
+        self.tabulating_outcomes = False # True if the bot is currently tabulating success/fail cards
         # Game features
         self.features = {
             # True means enabled; False disabled.
@@ -335,12 +355,19 @@ class Avalon(discord.Client):
                 await message.channel.send('Game has not yet started.')
                 return
             await message.channel.send('**Current team**:\n%s' % ', '.join([player.user.name for player in self.team]))
-            await message.channel.send('**Current results**:\n```\n%s\n%s\nReject counter: %d\n```' % \
+            await message.channel.send('**Current results**:\n```\n%s\n%s\nVote tracker: %d\n```' % \
                                        (' '.join([str(i[0]) for i in QUEST_LISTS[len(self.players)]]),
                                         ' '.join(['S' if i else 'F' for i in self.quest_results]),
                                         self.reject_counter))
             if self.lady:
                 await message.channel.send('%s currently has the Lady of the Lake' % self.lady.user.name)
+            await self.av_poke(message)
+
+
+
+    async def av_poke(self, message):
+        # av poke: pings people who the game is currently waiting for to make a decision
+        if (await self.check_running(message)):
             if self.waiting_for_votes:
                 await message.channel.send('*Currently waiting for the following players to cast their votes: %s*' % \
                                            ', '.join([p.user.mention for p in self.players if p.vote is None]))
@@ -351,10 +378,12 @@ class Avalon(discord.Client):
                 await message.channel.send('*Currently waiting for %s to play the Lady of the Lake*' % self.lady.user.mention)
             elif self.waiting_for_assassin:
                 await message.channel.send('*Currently waiting for %s to pick someone to assassinate*' % self.assassin.user.mention)
-            elif self.leader and (len(self.team) < self.current_mission[0]):
-                n = self.current_mission[0] - len(self.team)
+            elif self.leader and (len(self.team) < self.current_quest[0]):
+                n = self.current_quest[0] - len(self.team)
                 await message.channel.send('*Currently waiting for %s to pick %d %s team member%s*' % \
                                            (self.leader.user.mention, n, ('more' if self.team else ''), ('s' if n > 1 else '')))
+            else:
+                await message.channel.send('*Not currently waiting for anyone to make a decision.*')
 
 
 
@@ -460,7 +489,7 @@ class Avalon(discord.Client):
             for user in users:
                 player = self.find_player(user)
                 if not player:
-                    await message.channel.send('Error: %s is not part of the game.' % player.user.name)
+                    await message.channel.send('Error: %s is not part of the game.' % user.name)
                     return
                 if player in self.team + new_players:
                     await message.channel.send('Error: %s is already part of the team.' % player.user.name)
@@ -496,6 +525,11 @@ class Avalon(discord.Client):
         # av pickme: Pick yourself to join your team
         await self.pick(message, message.author)
 
+    async def av_pickrandom(self, message):
+        # av pickrandom: Pick a random person to join your team
+        if (await self.check_running(message)):
+            await self.pick(message, random.choice([p for p in self.players if p not in self.team]).user)
+
 
 
     async def vote(self, message, vote):
@@ -521,18 +555,28 @@ class Avalon(discord.Client):
                 await message.channel.send('Your vote has been updated.')
             player.vote = vote
             if not any([p.vote is None for p in self.players]):
-                accepted = (await self.tabulate_votes())
+                # Only do this *once*!
+                if not self.tabulating_votes:
+                    self.tabulating_votes = True
+                else:
+                    return
+                approved = (await self.tabulate_votes())
                 if self.running:
-                    if accepted:
+                    if approved:
                         await self.init_outcome()
                     else:
+                        self.has_team = False
                         await self.init_team()
+                # Reset the votes to make extra sure
+                for player in self.players:
+                    player.vote = None
+                self.tabulating_votes = False
 
 
 
-    async def av_accept(self, message):
-        # av accept: Signal that you approve of the proposed team.
-        await self.vote(message, ACCEPT)
+    async def av_approve(self, message):
+        # av approve: Signal that you approve of the proposed team.
+        await self.vote(message, APPROVE)
 
     async def av_reject(self, message):
         # av reject: Signal that you disapprove of the proposed team.
@@ -565,7 +609,14 @@ class Avalon(discord.Client):
                 return
             player.outcome = outcome
             await message.channel.send('Thank you for playing your card!')
-            if not any([p.outcome is None for p in self.team]):
+            if self.team and not any([p.outcome is None for p in self.team]):
+                # Only do this *once*!
+                if not self.tabulating_outcomes:
+                    self.tabulating_outcomes = True
+                else:
+                    return
+                if self.waiting_for_lady:
+                    return
                 await self.tabulate_outcome()
                 if self.running and not self.waiting_for_assassin:
                     if self.lady and (len(self.quest_results) >= 2):
@@ -573,7 +624,12 @@ class Avalon(discord.Client):
                         await self.main_channel.send('**Lady of the Lake:** %s, choose someone to investigate using "av lady".' % self.lady.user.mention)
                     else:
                         self.current_quest = next(self.quests)
+                        self.has_team = False
                         await self.init_team()
+                # Reset the outcomes to make extra sure
+                for player in self.players:
+                    player.outcome = None
+                self.tabulating_outcomes = False
 
 
 
@@ -619,6 +675,7 @@ class Avalon(discord.Client):
             self.lady = player
             self.waiting_for_lady = False
             self.current_quest = next(self.quests)
+            self.has_team = False
             await self.init_team()
             
 
@@ -647,15 +704,17 @@ class Avalon(discord.Client):
                 await asyncio.sleep(5) # Pause for dramatic effect
             if Role.MERLIN in player.role:
                 await message.channel.send('**The game is over. %s correctly identified Merlin. Evil wins!!**' % self.assassin.user.mention)
+                await self.finish_game(EVIL)
             else:
                 await message.channel.send('**The game is over. %s failed to identify Merlin. Good wins!!**' % self.assassin.user.mention)
-            await self.finish_game()
+                await self.finish_game(GOOD)
+            
 
 
 
     async def av_roles(self, message):
         # av characters: DMs character info
-        await message.author.send('''Avalon character roles:
+        await message.author.send('''**Avalon character roles:**
 
 Merlin - a Servant of Arthur who knows all the Minions of Mordred
 Percival - a Servant of Arthur who knows the identity of Merlin
@@ -676,16 +735,93 @@ Lady of the Lake - a card used to learn the alignment of another player''')
     async def av_ping(self, message):
         # av ping: Ping the Avalon bot
         await message.channel.send('pong')
+
+    async def av_coin(self, message):
+        # av coin: Simulate a random coin flip
+        await message.channel.send(random.choice(['heads', 'tails']))
+
+
+
+    async def av_stats(self, message):
+        # av stats: Print out the player stats
+        with open('avalon_stats', 'rb') as o:
+            stats = pickle.load(o)
+        if not stats:
+            await message.channel.send('No statistical data is currently stored')
+        # Figure out which format of data we want
+        role = 0
+        if message.mentions:
+            stats = stats.get(message.mentions[0].id)
+            if not stats:
+                await message.channel.send('No statistical data exists for this player')
+                return
+        else:
+            content = message.content.split(None, 2)
+            if len(content) == 3:
+                role_cmd = content[2].lower()
+                if role_cmd not in ROLE_COMMANDS[1:]:
+                    await message.channel.send('Invalid role "%s": should be one of %s' % (role_cmd, ', '.join(ROLE_COMMANDS[1:])))
+                    return
+                role = ROLE_COMMANDS.index(role_cmd)
+                stats = dict([[id, stats[id][role]] for id in stats if role in stats[id]])
+                if not stats:
+                    await message.channel.send('No statistical data exists for this role')
+                    return
+            else:
+                stats = dict([(id, [sum([i[0] for i in stats[id].values()]),
+                                    sum([i[1] for i in stats[id].values()])]) \
+                              for id in stats])
+        # Create the rows of data
+        rows = []
+        for id, (win, loss) in stats.items():
+            if message.mentions:
+                # id is a role number then
+                name = ROLE_NAMES[id]
+            else:
+                # id is a user id
+                p = discord.utils.get(self.get_all_members(), id=id)
+                if p is None:
+                    continue
+                name = p.name
+            rows.append([name, win, loss, win+loss, float(win * 100) / (win + loss)])
+        # Sort and format the rows
+        rows.sort(key = lambda x: x[-1], reverse=True)
+        for row in rows:
+            row[-1] = ('%.4g%%' % row[-1])
+        rows = [list(map(str, row)) for row in rows]
+        # Add the header
+        rows.insert(0, ['Role' if message.mentions else 'Player', 'Wins', 'Losses', 'Total', 'Win Ratio'])
+        lengths = [max([len(row[i]) for row in rows]) for i in range(5)]
+        # Add the footer if necessary
+        if message.mentions:
+            win  = sum([int(i[1]) for i in rows[1:]])
+            loss = sum([int(i[2]) for i in rows[1:]])
+            rows.append(['Total', str(win), str(loss), str(win+loss), '%.4g%%' % (float(win * 100) / (win + loss))])
+        # Print out the descriptive message at the top
+        if message.mentions:
+            await message.channel.send('**Avalon player stats for %s:**' % message.mentions[0].mention)
+        elif role:
+            await message.channel.send('**Avalon player stats for %s:**' % ROLE_NAMES[role])
+        else:
+            await message.channel.send('**Avalon player stats:**')
+        # Align the rows
+        divider = '+%s+\n' % '+'.join(['-'*l for l in lengths])
+        rows = ['|%s|\n' % '|'.join([entry.rjust(l) for entry, l in zip(row, lengths)]) for row in rows]
+        table = divider + divider.join(rows) + divider
+        # Print out the whole table
+        await message.channel.send('```\n%s```' % table)
+        
                 
 
 
     async def av_help(self, message):
         # av help: DMs list of commands
-        await message.author.send('''Avalon bot commands:
+        await message.author.send('''**Avalon bot commands:**
 
-av accept: Vote yes to a proposed team
+av approve: Vote yes to a proposed team
 av assassinate: Try to kill Merlin (if you are the Assassin and it is the end of the game)
 av cancel: Cancel a game you created
+av coin: Simulate a random coin flip
 av create: Create a new game
 av disable: Disable a feature of the game
 av enable: Enable a feature of the game
@@ -698,43 +834,18 @@ av leave: Leave a game before it begins
 av merge: Merge two special roles
 av pick: Pick someone as a member of your team (note there is no way to "un-pick" them later!)
 av pickme: Shortcut to pick yourself for your own team
+av pickrandom: Pick a random person to join your team
 av ping: Ping the Avalon bot
+av poke: Pokes people who need to make a decision
 av reject: Vote no to a proposed team
 av roles: Print out info about the gameplay roles
 av rules: Gives link to the game rulebook
 av start: Start the game that was previously created
+av stats: Print out the player stats
 av success: Signal that a quest should succeed
 av unmerge: Unmerge all previously merged special roles''')
 
 
-
-    async def av_debug(self, message):
-        # av debug: For debugging only!!
-        await message.channel.send('You do not have permission to run debugging commands!')
-        return
-        start = message.content.find('```')
-        if start == -1:
-            await message.channel.send('Syntax: av debug ```[code]```')
-            return
-        start += 3
-        end = message.content.find('```', start)
-        if end == -1:
-            await message.channel.send('Syntax: av debug ```[code]```')
-            return
-        code = message.content[start:end]
-        outp = io.StringIO()
-        old_stdout = sys.stdout
-        old_stderr = sys.stderr
-        sys.stdout = sys.stderr = outp
-        try:
-            exec(code)
-        except:
-            traceback.print_exc()
-        sys.stdout = old_stdout
-        sys.stderr = old_stderr
-        s = outp.getvalue()
-        if s:
-            await message.channel.send('```%s```' % s)
 
 
 
@@ -774,11 +885,11 @@ av unmerge: Unmerge all previously merged special roles''')
         for merge in self.merged:
             good_merge = tuple([role for role in merge if role in special_good])
             evil_merge = tuple([role for role in merge if role in special_evil])
-            if len(good) > 2:
+            if len(good_merge) >= 2:
                 for role in good_merge:
                     special_good.remove(role)
                 special_good.append(good_merge)
-            elif len(evil) > 2:
+            elif len(evil_merge) >= 2:
                 for role in evil_merge:
                     special_evil.remove(role)
                 special_evil.append(evil_merge)
@@ -791,7 +902,7 @@ av unmerge: Unmerge all previously merged special roles''')
         for role in rejected_roles:
             if not isinstance(role, tuple):
                 role = (role,)
-            await self.main_channel.send('Switching %s off because there are not enough players.' % '/'.join(role))
+            await self.main_channel.send('Switching %s off because there are not enough players.' % '/'.join([ROLE_NAMES[r.value] for r in role]))
             for sub in role:
                 feature = ROLE_NAMES[sub.value].lower()
                 if feature in self.features:
@@ -838,6 +949,9 @@ av unmerge: Unmerge all previously merged special roles''')
 
     async def init_team(self):
         # Announce a new leader and let them pick a team
+        if self.has_team:
+            return # Shouldn't happen (but does... ugh)
+        self.has_team = True
         if self.leader:
             index = self.players.index(self.leader)
             self.leader = self.players[(index + 1) % len(self.players)]
@@ -861,7 +975,7 @@ av unmerge: Unmerge all previously merged special roles''')
             for player in self.players:
                 player.vote = None
             await self.main_channel.send('''Everyone: the team for this quest is %s.
-Please cast your votes **privately** by DMing either "av accept" or "av reject" to %s.''' % \
+Please cast your votes **privately** by DMing either "av approve" or "av reject" to %s.''' % \
                                          (', '.join([player.user.mention for player in self.team]), self.user.mention))
 
 
@@ -869,13 +983,13 @@ Please cast your votes **privately** by DMing either "av accept" or "av reject" 
         # Tabulate the votes that were cast
         if self.waiting_for_votes:
             self.waiting_for_votes = False
-            await self.main_channel.send('Voting for the team has concluded. Results are:\n%s' % '\n'.join(['%s: %s' % (p.user.name, 'Approve' if p.vote else 'Reject') for p in self.players]))
+            await self.main_channel.send('Voting for the team has concluded. Results are:\n%s' % '\n'.join(['%s: %s' % (p.user.name, 'Approve' if p.vote == APPROVE else 'Reject') for p in self.players]))
             if sum([p.vote for p in self.players]) > len(self.players) // 2:
                 await self.main_channel.send('The team consisting of %s was approved!' % ', '.join([player.user.mention for player in self.team]))
-                self.reject_counter = 0
+                self.reject_counter = 1
                 return True
             self.reject_counter += 1
-            await self.main_channel.send('The team consisting of %s was rejected. Reject counter is now at **%d** out of 5.' % \
+            await self.main_channel.send('The team consisting of %s was rejected. Vote tracker is now at **%d** out of 5.' % \
                                          (', '.join([player.user.mention for player in self.team]), self.reject_counter))
             await self.check_for_winner()
         return False
@@ -917,10 +1031,10 @@ Please cast your votes **privately** by DMing either "av accept" or "av reject" 
         # Check for a winner
         if self.quest_results.count(False) >= 3:
             await self.main_channel.send('**The game is over. Evil wins!!**')
-            await self.finish_game()
+            await self.finish_game(EVIL)
         elif self.reject_counter >= 5:
             await self.main_channel.send('**The game is over. Evil wins!!**')
-            await self.finish_game()
+            await self.finish_game(EVIL)
         elif self.quest_results.count(True) >= 3:
             if self.features['merlin']:
                 self.assassin = [p for p in self.players if Role.ASSASSIN in p.role][0]
@@ -928,16 +1042,29 @@ Please cast your votes **privately** by DMing either "av accept" or "av reject" 
                 await self.main_channel.send('**Good is about to win.** %s, choose someone to assassinate using "av assassinate".' % self.assassin.user.mention)
             else:
                 await self.main_channel.send('**The game is over. Good wins!!**')
-                await self.finish_game()
+                await self.finish_game(GOOD)
 
 
-    async def finish_game(self):
+    async def finish_game(self, winner):
         # Announce the roles and clear the `running' flag
         self.owner = None
         self.running = False
         await self.main_channel.send('Game role reveals:')
+        with open('avalon_stats', 'rb') as o:
+            stats = pickle.load(o)
         for p in self.players:
             await self.main_channel.send('%s: %s' % (p.user.mention, '/'.join([ROLE_NAMES[role.value] for role in p.role])))
+            pdata = stats.setdefault(p.user.id, {})
+            for role in p.role:
+                rdata = pdata.setdefault(role.value, [0, 0])
+                if p.side == winner:
+                    rdata[0] += 1
+                else:
+                    rdata[1] += 1
+        with open('avalon_stats', 'wb') as o:
+            pickle.dump(stats, o)
+        
+            
         
         
 
